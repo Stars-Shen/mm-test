@@ -1,0 +1,17 @@
+{
+  "target": "label_stai1",
+  "model": "rf",
+  "n_samples": 22,
+  "n_users": 22,
+  "n_features_initial": 268,
+  "n_features_final": 258,
+  "drop_panas": true,
+  "use_stai2_feature": false,
+  "max_missing_ratio": 0.4,
+  "add_missing_indicator": false,
+  "cv": {
+    "mae": 6.862423089116273,
+    "rmse": 8.426350022071611,
+    "spearman": 0.2448405047451309
+  }
+}

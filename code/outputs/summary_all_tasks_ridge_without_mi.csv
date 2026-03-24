@@ -1,0 +1,3 @@
+target,model,setting,n_samples,n_users,n_features,mae,rmse,spearman
+label_daily_stress,ridge,without_missing_indicator,22,22,268,13.245448495603522,18.64555989337077,0.3450231211370707
+label_stai1,ridge,without_missing_indicator,22,22,268,9.105653698709842,11.386540990704544,0.07463959959897755

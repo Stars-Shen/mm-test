@@ -1,0 +1,17 @@
+{
+  "target": "label_daily_stress",
+  "model": "rf",
+  "n_samples": 22,
+  "n_users": 22,
+  "n_features_initial": 268,
+  "n_features_final": 258,
+  "drop_panas": true,
+  "use_stai2_feature": false,
+  "max_missing_ratio": 0.4,
+  "add_missing_indicator": false,
+  "cv": {
+    "mae": 12.54416122808168,
+    "rmse": 16.761473823250267,
+    "spearman": 0.004524893391961582
+  }
+}

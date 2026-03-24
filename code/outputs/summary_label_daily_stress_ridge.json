@@ -1,0 +1,16 @@
+{
+  "target": "label_daily_stress",
+  "model": "ridge",
+  "n_samples": 22,
+  "n_users": 22,
+  "n_features": 268,
+  "drop_panas": true,
+  "use_stai2_feature": false,
+  "max_missing_ratio": 0.4,
+  "add_missing_indicator": false,
+  "cv": {
+    "mae": 13.245448495603522,
+    "rmse": 18.64555989337077,
+    "spearman": 0.3450231211370707
+  }
+}
