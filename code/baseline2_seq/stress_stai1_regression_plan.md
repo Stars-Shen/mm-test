@@ -380,3 +380,88 @@ mean best_val_mae=10.3530 ± 4.8666
   - `--rr_patch_sec`
   - `--use_delta_features`
   - `--use_cross_modal_attn`
+
+### 8.7 当前已落地实现（代码状态）
+
+已完成的改造：
+
+- `preprocess_multimodal_events.py` 已升级为统一窗口 patch 预处理（默认 `--window_min 5`）
+- RR / Activity / Sleep 都输出 patch 序列（变长）
+- 增加 patch 内动态特征（slope）与 patch 间动态特征（delta）
+- `dataset_event.py` 的时间特征改为优先使用真实时间列（`patch_center_min`）构建相对时间编码
+
+字段含义（关键）：
+
+- `slope`：patch 内趋势（段内变化），如 `ibi_slope` / `hr_slope`
+  - 含义：该 patch 内信号是上升还是下降，以及变化快慢
+- `delta`：相邻 patch 的差分（段间变化），如 `delta_ibi_mean` / `delta_hr_mean`
+  - 含义：当前 patch 相对上一 patch 的跳变幅度
+- `time_feat=[delta_time, since_day_start]`
+  - `delta_time`：相邻 token 的时间间隔（归一化）
+  - `since_day_start`：token 在当天中的相对位置（归一化）
+
+当前 patch 特征维度（window=5min）：
+
+- RR token dim = 17
+- ACT token dim = 19
+- SLEEP token dim = 12
+
+建议运行流程：
+
+1. 重建 patch 数据
+   - `python preprocess_multimodal_events.py --window_min 5`
+2. 训练 event 模型
+   - `torchrun --standalone --nproc_per_node=2 train_regression.py --data_format event --target label_daily_stress --num_workers 0 ...`
+
+备注：
+- 这版改造已将 RR 序列从“几万点级 token”降为“百级 patch token”，并保留关键前后变化语义。
+
+
+
+3.25代码改动
+1、新增双分支数据组织与弱对齐（按 day 对齐，模态内的融合，structured保稳定全局，event保细节）
+dataset_hybrid.py
+2、新增两级策略模型
+级别1：弱对齐（dataset 统一 day 槽位）-》时间对齐
+级别2：学习式对齐（每模态 cross-attention + 门控融合）-》语义对齐，该关注谁，和谁相关，门控控制应该相信谁多一点
+model_multimodal_regression.py (line 272)
+DualBranchAlignBlock + MultiModalHybridRegressor
+3、训练入口支持 hybrid，且保留原 structured/event
+train_regression.py (line 363)
+新增 --data_format hybrid
+新增 --hybrid_align_heads、--hybrid_align_dropout
+修复 event npz 的 numpy 版本兼容问题（你之前遇到过）
+dataset_event.py (line 41)
+feat_names 读取失败会自动回填默认特征名，不再因为 numpy._core 崩溃
+训练脚本模板也加了 hybrid 参数
+
+不足：当前不能区分模态到底是真的缺失还是说一直在检测只是没有，比如user11的sleep模态，可能根本就没睡，而不是没检测-》 obs_mask：该模态当天是否可观测（是否有记录能力） event_flag：该窗口是否发生了睡眠/活动（0也有语义，不等于缺失）
+
+    跨模态对齐配合模态内对齐
+
+1. 模态表征（先做）
+
+用“个体基线偏离”替代绝对值：x_t - personal_baseline，尤其对 RR/HRV 很有效。
+保留 patch 的动态特征：delta + slope + rolling std，再加“恢复速度”特征（活动后 10/20/30 分钟 HRV 回升幅度）。
+给每个模态加“缺失/可信度”指示器（sleep 稀疏时很重要），作为模型输入而不只是 mask。
+对 RR 做轻量自监督预训练（mask 重建或下一 patch 预测），再微调回归头。
+2. 融合方式（第二步）
+
+你现在 hybrid 很对，下一步可加“时延融合”：让 RR<-Activity 的 attention 允许 ±K 个 patch 偏移（处理生理反应滞后）。
+用门控融合加先验约束：活动强时降低“压力相关心率升高”的权重，减少运动混淆。
+加跨分支一致性约束：structured 分支和 event 分支同一天 embedding 不要差太远（L2 consistency）。
+3. Loss 设计（马上能见效）
+
+主损失从纯 MSE 改为 Huber 或 0.7*MSE + 0.3*MAE（抗异常值更稳）。
+多任务联合（stress + stai1 + stai2）并用不确定性加权，比单任务通常更稳。
+对目标做 fold 内标准化训练、预测后反标准化，优化会更容易。
+可加排序损失（pairwise rank），强化“高压日 > 低压日”的相对关系。
+4. 训练策略（别忽略）
+
+严格按 user_id 分组验证（你现在在做，保持）。
+小样本时模型容量再降一点（embed_dim/heads），常比加深网络更好。
+报告 MAE 为主、MSE 为辅；MSE 几百在量纲上并不奇怪。
+
+
+
+

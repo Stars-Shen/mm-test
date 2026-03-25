@@ -1,24 +1,20 @@
 from __future__ import annotations
 
 """
-多模态事件序列预处理脚本（RR / Activity / Sleep）
-=================================================
+多模态事件序列预处理（Patch版本：RR / Activity / Sleep）
+=======================================================
 
-本脚本做的事：
-1) 把每个用户每天（user_id + day）组织成一个 sample_id。
-2) 为每个 sample_id 构建三种变长事件序列：
-   - RR events    : [T_rr, D_rr]
-   - ACT events   : [T_act, D_act]
-   - SLEEP events : [T_sleep, D_sleep]
-3) 输出：
-   - multimodal_event_sequences.npz：保存所有 sample 的事件序列
-   - multimodal_event_index.csv：保存 sample 索引、长度、标签、是否缺失
+目标：
+1) 统一按时间窗口（patch）构建序列，避免RR等间隔抽点丢失局部变化。
+2) 保留模态内动态：patch内统计 + patch间delta/slope。
+3) 为后续跨模态时序融合提供可对齐的时间语义（patch_center_min）。
 
-说明：
-- 这是“事件序列”方案，不是小时桶统计方案。
-- 序列长度 T 是变长的，训练时需要 padding + mask。
+输出：
+- multimodal_event_sequences.npz
+- multimodal_event_index.csv
 """
 
+import argparse
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -26,76 +22,39 @@ import numpy as np
 import pandas as pd
 
 
-# =========================
-# 路径配置
-# =========================
 DATA_ROOT = Path('/home/wqshen/mm-test/dataset/physionet.org/files/mmash/1.0.0/DataPaper')
 LABEL_PATH = Path('/home/wqshen/mm-test/code/processed/mmash_day_level_features.csv')
 OUT_DIR = Path('/home/wqshen/mm-test/code/baseline2_seq/processed')
-OUT_NPZ = OUT_DIR / 'multimodal_event_sequences.npz'
-OUT_INDEX = OUT_DIR / 'multimodal_event_index.csv'
 
+RR_PATCH_FEAT = [
+    'patch_start_min', 'patch_end_min', 'patch_center_min',
+    'rr_count', 'ibi_mean', 'ibi_std', 'ibi_min', 'ibi_max',
+    'hr_mean', 'hr_std', 'rmssd', 'sdnn', 'pnn50',
+    'ibi_slope', 'hr_slope', 'delta_ibi_mean', 'delta_hr_mean',
+]
 
-# =========================
-# 事件特征定义（每个token的维度）
-# =========================
-RR_EVENT_FEAT = ['hour', 'minute_of_hour', 'second_of_minute', 'ibi_s', 'hr_inst']
-ACT_EVENT_FEAT = ['start_hour', 'end_hour', 'duration_min', 'activity_code']
-SLEEP_EVENT_FEAT = [
-    'start_hour', 'end_hour', 'duration_min', 'cross_day', 'cross_hour',
-    'efficiency', 'latency', 'tst', 'waso', 'n_awakenings'
+ACT_PATCH_FEAT = [
+    'patch_start_min', 'patch_end_min', 'patch_center_min',
+    'active_minutes', 'event_count', 'intensity_mean',
+    'delta_active_minutes', 'slope_active_minutes',
+] + [f'code_{i}_minutes' for i in range(11)]
+
+SLEEP_PATCH_FEAT = [
+    'patch_start_min', 'patch_end_min', 'patch_center_min',
+    'sleep_minutes', 'segment_count',
+    'delta_sleep_minutes', 'slope_sleep_minutes',
+    'efficiency', 'latency', 'tst', 'waso', 'n_awakenings',
 ]
 
 
-# =========================
-# 通用工具
-# =========================
 def _safe_float(x) -> float:
-    """安全转float，失败返回NaN。"""
     try:
         return float(x)
     except Exception:
         return np.nan
 
 
-def _to_minute(hhmm: str) -> int:
-    """'HH:MM' -> 分钟数。"""
-    h, m = hhmm.strip().split(':')
-    return int(h) * 60 + int(m)
-
-
-def _parse_hms(s: str) -> Tuple[int, int, int]:
-    """解析 'HH:MM' 或 'HH:MM:SS'。"""
-    p = str(s).strip().split(':')
-    if len(p) == 3:
-        return int(p[0]), int(p[1]), int(p[2])
-    if len(p) == 2:
-        return int(p[0]), int(p[1]), 0
-    return 0, 0, 0
-
-
-def _read_csv_maybe_skip_comment(path: Path, required_col: str) -> pd.DataFrame:
-    """
-    MMASH原始CSV有时第一行是注释：
-    - 先普通读取
-    - 若不存在 required_col，自动 skiprows=1 重读
-    """
-    df = pd.read_csv(path)
-    if required_col not in df.columns:
-        df = pd.read_csv(path, skiprows=1)
-    if len(df.columns) > 0 and df.columns[0] == '':
-        # 清理空首列（索引残留）
-        df = df.drop(columns=[df.columns[0]])
-    return df
-
-
 def _normalize_day(day_val: int) -> int:
-    """
-    统一day到{1,2}：
-    - day=1 -> 1
-    - day=2 -> 2
-    - 其他异常值（如-29）-> 2
-    """
     if day_val == 1:
         return 1
     if day_val == 2:
@@ -103,14 +62,53 @@ def _normalize_day(day_val: int) -> int:
     return 2
 
 
-# =========================
-# 标签加载
-# =========================
+def _read_csv_maybe_skip_comment(path: Path, required_col: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    if required_col not in df.columns:
+        df = pd.read_csv(path, skiprows=1)
+    if len(df.columns) > 0 and df.columns[0] == '':
+        df = df.drop(columns=[df.columns[0]])
+    return df
+
+
+def _parse_hms_to_second(s: str) -> int:
+    p = str(s).strip().split(':')
+    if len(p) == 3:
+        h, m, sec = int(p[0]), int(p[1]), int(p[2])
+    elif len(p) == 2:
+        h, m, sec = int(p[0]), int(p[1]), 0
+    else:
+        return 0
+    return h * 3600 + m * 60 + sec
+
+
+def _to_minute(hhmm: str) -> int:
+    h, m = hhmm.strip().split(':')
+    return int(h) * 60 + int(m)
+
+
+def _window_bounds(window_min: int) -> np.ndarray:
+    n = int(np.ceil(1440 / window_min))
+    starts = np.arange(n, dtype=np.int32) * window_min
+    ends = np.minimum(starts + window_min, 1440)
+    return np.stack([starts, ends], axis=1)
+
+
+def _rolling_slope(x: np.ndarray, y: np.ndarray) -> float:
+    if x.size < 2 or np.allclose(x, x[0]):
+        return 0.0
+    xm = x.mean()
+    ym = y.mean()
+    den = np.sum((x - xm) ** 2)
+    if den <= 1e-8:
+        return 0.0
+    num = np.sum((x - xm) * (y - ym))
+    return float(num / den)
+
+
 def load_labels() -> pd.DataFrame:
-    """读取并去重day-level标签。"""
     if not LABEL_PATH.exists():
         return pd.DataFrame(columns=['user_id', 'day'])
-
     df = pd.read_csv(LABEL_PATH)
     keep = [c for c in ['user_id', 'day', 'label_daily_stress', 'label_stai1', 'label_stai2'] if c in df.columns]
     out = df[keep].drop_duplicates(['user_id', 'day']).copy()
@@ -118,18 +116,9 @@ def load_labels() -> pd.DataFrame:
     return out
 
 
-# =========================
-# RR 事件构建
-# =========================
-def build_rr_events(rr_csv: Path) -> Dict[int, np.ndarray]:
-    """
-    返回 {day: rr_events}，其中 rr_events 形状为 [T_rr, 4]。
-
-    token = [hour, minute_of_hour, second_of_minute, ibi_s, hr_inst]
-    """
+def build_rr_patches(rr_csv: Path, window_min: int) -> Dict[int, np.ndarray]:
     if not rr_csv.exists():
         return {}
-
     df = _read_csv_maybe_skip_comment(rr_csv, 'ibi_s')
     if not {'ibi_s', 'day', 'time'}.issubset(df.columns):
         return {}
@@ -137,42 +126,80 @@ def build_rr_events(rr_csv: Path) -> Dict[int, np.ndarray]:
     df['ibi_s'] = pd.to_numeric(df['ibi_s'], errors='coerce')
     df['day'] = pd.to_numeric(df['day'], errors='coerce')
     df = df.dropna(subset=['ibi_s', 'day', 'time']).copy()
-
-    # 去除明显伪迹
     df = df[(df['ibi_s'] >= 0.2) & (df['ibi_s'] <= 2.5)]
     if df.empty:
         return {}
 
-    events_by_day: Dict[int, List[List[float]]] = {}
-    for _, r in df.iterrows():
-        d = _normalize_day(int(r['day']))
-        h, m, s = _parse_hms(str(r['time']))
-        ibi = float(r['ibi_s'])
-        hr_inst = 60.0 / ibi if ibi > 1e-6 else 0.0
-        events_by_day.setdefault(d, []).append([float(h), float(m), float(s), ibi, hr_inst])
+    df['day'] = df['day'].astype(int).apply(_normalize_day)
+    df['sec'] = df['time'].astype(str).apply(_parse_hms_to_second)
+    df['hr'] = 60.0 / df['ibi_s']
 
-    out = {}
-    for d, arr in events_by_day.items():
-        x = np.array(arr, dtype=np.float32)
-        # 按 (hour, minute, second) 排序
-        idx = np.lexsort((x[:, 2], x[:, 1], x[:, 0]))
-        out[d] = x[idx]
+    by_day: Dict[int, np.ndarray] = {}
+    bounds = _window_bounds(window_min)
 
-    return out
+    for d, g in df.groupby('day'):
+        g = g.sort_values('sec')
+        rows: List[List[float]] = []
+
+        prev_ibi_mean = np.nan
+        prev_hr_mean = np.nan
+        prev_center = np.nan
+        prev_ibi_for_slope = np.nan
+        prev_hr_for_slope = np.nan
+
+        for st_m, ed_m in bounds:
+            st_s = int(st_m) * 60
+            ed_s = int(ed_m) * 60
+            gg = g[(g['sec'] >= st_s) & (g['sec'] < ed_s)]
+            if gg.empty:
+                continue
+
+            ibi = gg['ibi_s'].to_numpy(dtype=np.float32)
+            hr = gg['hr'].to_numpy(dtype=np.float32)
+            sec_rel = gg['sec'].to_numpy(dtype=np.float32) - float(st_s)
+
+            rmssd = float(np.sqrt(np.mean(np.diff(ibi) ** 2))) if ibi.size >= 2 else 0.0
+            sdnn = float(np.std(ibi)) if ibi.size >= 2 else 0.0
+            pnn50 = float(np.mean(np.abs(np.diff(ibi)) > 0.05)) if ibi.size >= 2 else 0.0
+
+            ibi_mean = float(np.mean(ibi))
+            hr_mean = float(np.mean(hr))
+            center = float((st_m + ed_m) / 2.0)
+
+            ibi_slope_in_patch = _rolling_slope(sec_rel, ibi)
+            hr_slope_in_patch = _rolling_slope(sec_rel, hr)
+
+            delta_ibi_mean = 0.0 if np.isnan(prev_ibi_mean) else float(ibi_mean - prev_ibi_mean)
+            delta_hr_mean = 0.0 if np.isnan(prev_hr_mean) else float(hr_mean - prev_hr_mean)
+
+            if not np.isnan(prev_center):
+                dt = max(center - prev_center, 1.0)
+                if not np.isnan(prev_ibi_for_slope):
+                    ibi_slope_in_patch += float((ibi_mean - prev_ibi_for_slope) / dt)
+                if not np.isnan(prev_hr_for_slope):
+                    hr_slope_in_patch += float((hr_mean - prev_hr_for_slope) / dt)
+
+            rows.append([
+                float(st_m), float(ed_m), center,
+                float(ibi.size), ibi_mean, float(np.std(ibi)), float(np.min(ibi)), float(np.max(ibi)),
+                hr_mean, float(np.std(hr)), rmssd, sdnn, pnn50,
+                float(ibi_slope_in_patch), float(hr_slope_in_patch), delta_ibi_mean, delta_hr_mean,
+            ])
+
+            prev_ibi_mean = ibi_mean
+            prev_hr_mean = hr_mean
+            prev_center = center
+            prev_ibi_for_slope = ibi_mean
+            prev_hr_for_slope = hr_mean
+
+        by_day[int(d)] = np.array(rows, dtype=np.float32) if rows else np.zeros((0, len(RR_PATCH_FEAT)), dtype=np.float32)
+
+    return by_day
 
 
-# =========================
-# Activity 事件构建
-# =========================
-def build_activity_events(act_csv: Path) -> Dict[int, np.ndarray]:
-    """
-    返回 {day: act_events}，其中 act_events 形状为 [T_act, 4]。
-
-    token = [start_hour, end_hour, duration_min, activity_code]
-    """
+def build_activity_patches(act_csv: Path, window_min: int) -> Dict[int, np.ndarray]:
     if not act_csv.exists():
         return {}
-
     df = _read_csv_maybe_skip_comment(act_csv, 'Activity')
     if not {'Activity', 'Start', 'Day'}.issubset(df.columns):
         return {}
@@ -181,23 +208,25 @@ def build_activity_events(act_csv: Path) -> Dict[int, np.ndarray]:
     df['Day'] = pd.to_numeric(df['Day'], errors='coerce')
     df = df.dropna(subset=['Activity', 'Day', 'Start']).copy()
 
-    events_by_day: Dict[int, List[List[float]]] = {}
+    intensity_map = {0: 0.0, 1: 0.2, 2: 0.4, 3: 0.6, 4: 0.8, 5: 1.0, 6: 0.5, 7: 0.2, 8: 0.2, 9: 0.1, 10: 0.1}
+
+    bounds = _window_bounds(window_min)
+    by_day_rows: Dict[int, List[List[float]]] = {}
+
+    events_by_day: Dict[int, List[Tuple[int, int, int]]] = {}
     for _, r in df.iterrows():
         code = int(r['Activity'])
         if code < 0 or code > 10:
             continue
-
         d = _normalize_day(int(r['Day']))
 
         st = str(r['Start'])
         ed = str(r['End']) if 'End' in df.columns and not pd.isna(r.get('End', np.nan)) else ''
-
         try:
             st_m = _to_minute(st)
         except Exception:
             continue
 
-        # 缺失结束时间时，用 +30min 作为兜底
         if ed and ':' in ed:
             try:
                 ed_m = _to_minute(ed)
@@ -206,45 +235,69 @@ def build_activity_events(act_csv: Path) -> Dict[int, np.ndarray]:
         else:
             ed_m = st_m + 30
 
-        # 跨午夜修正
         if ed_m <= st_m:
             ed_m += 1440
 
-        dur = float(ed_m - st_m)
-        st_hour = float((st_m // 60) % 24)
-        ed_hour = float((ed_m // 60) % 24)
+        events_by_day.setdefault(d, []).append((st_m, ed_m, code))
 
-        events_by_day.setdefault(d, []).append([st_hour, ed_hour, dur, float(code)])
+    for d, events in events_by_day.items():
+        rows: List[List[float]] = []
+        prev_active = np.nan
+        prev_center = np.nan
 
-    out = {}
-    for d, arr in events_by_day.items():
-        x = np.array(arr, dtype=np.float32)
-        idx = np.argsort(x[:, 0])
-        out[d] = x[idx]
+        for st_m, ed_m in bounds:
+            active_minutes = 0.0
+            event_count = 0.0
+            weighted_intensity = 0.0
+            code_minutes = np.zeros((11,), dtype=np.float32)
 
-    return out
+            for ev_st, ev_ed, code in events:
+                ov_st = max(st_m, ev_st)
+                ov_ed = min(ed_m, ev_ed)
+                ov = float(max(0, ov_ed - ov_st))
+                if ov <= 0:
+                    continue
+                active_minutes += ov
+                event_count += 1.0
+                code_minutes[code] += ov
+                weighted_intensity += ov * float(intensity_map.get(code, 0.0))
+
+            if active_minutes <= 0:
+                continue
+
+            center = float((st_m + ed_m) / 2.0)
+            intensity_mean = float(weighted_intensity / max(active_minutes, 1e-6))
+            delta_active = 0.0 if np.isnan(prev_active) else float(active_minutes - prev_active)
+            slope_active = 0.0
+            if not np.isnan(prev_center):
+                dt = max(center - prev_center, 1.0)
+                slope_active = float((active_minutes - prev_active) / dt)
+
+            row = [
+                float(st_m), float(ed_m), center,
+                float(active_minutes), float(event_count), intensity_mean,
+                delta_active, slope_active,
+            ] + code_minutes.tolist()
+            rows.append(row)
+
+            prev_active = active_minutes
+            prev_center = center
+
+        by_day_rows[int(d)] = np.array(rows, dtype=np.float32) if rows else np.zeros((0, len(ACT_PATCH_FEAT)), dtype=np.float32)
+
+    return by_day_rows
 
 
-# =========================
-# Sleep 事件构建
-# =========================
-def build_sleep_events(sleep_csv: Path) -> Dict[int, np.ndarray]:
-    """
-    返回 {day: sleep_events}，其中 sleep_events 形状为 [T_sleep, 10]。
-
-    token = [
-      start_hour, end_hour, duration_min, cross_day, cross_hour,
-      efficiency, latency, tst, waso, n_awakenings
-    ]
-    """
+def build_sleep_patches(sleep_csv: Path, window_min: int) -> Dict[int, np.ndarray]:
     if not sleep_csv.exists():
         return {}
-
     df = _read_csv_maybe_skip_comment(sleep_csv, 'In Bed Date')
     if not {'In Bed Date', 'In Bed Time', 'Out Bed Date', 'Out Bed Time'}.issubset(df.columns):
         return {}
 
-    events_by_day: Dict[int, List[List[float]]] = {}
+    bounds = _window_bounds(window_min)
+    by_day_rows: Dict[int, List[List[float]]] = {}
+
     for _, r in df.iterrows():
         in_day = _safe_float(r['In Bed Date'])
         out_day = _safe_float(r['Out Bed Date'])
@@ -259,19 +312,10 @@ def build_sleep_events(sleep_csv: Path) -> Dict[int, np.ndarray]:
 
         d = _normalize_day(int(in_day))
 
-        start_abs = d * 1440 + st_m
-        end_abs = int(out_day) * 1440 + ed_m
-        if end_abs <= start_abs:
-            end_abs += 1440
-
-        dur = float(end_abs - start_abs)
-        if dur <= 0:
-            continue
-
-        st_hour = float((st_m // 60) % 24)
-        ed_hour = float((ed_m // 60) % 24)
-        cross_day = 1.0 if int(out_day) != int(in_day) else 0.0
-        cross_hour = 1.0 if (st_m // 60) != ((ed_m - 1) // 60) else 0.0
+        st_abs = d * 1440 + st_m
+        ed_abs = int(out_day) * 1440 + ed_m
+        if ed_abs <= st_abs:
+            ed_abs += 1440
 
         eff = _safe_float(r.get('Efficiency', np.nan))
         lat = _safe_float(r.get('Latency', np.nan))
@@ -279,62 +323,86 @@ def build_sleep_events(sleep_csv: Path) -> Dict[int, np.ndarray]:
         waso = _safe_float(r.get('Wake After Sleep Onset (WASO)', np.nan))
         awak = _safe_float(r.get('Number of Awakenings', np.nan))
 
-        events_by_day.setdefault(d, []).append([
-            st_hour, ed_hour, dur, cross_day, cross_hour, eff, lat, tst, waso, awak
-        ])
+        rows: List[List[float]] = []
+        prev_sleep = np.nan
+        prev_center = np.nan
 
-    out = {}
-    for d, arr in events_by_day.items():
-        x = np.array(arr, dtype=np.float32)
-        # 数值缺失统一填0；训练时可配合缺失指示器
-        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-        idx = np.argsort(x[:, 0])
-        out[d] = x[idx]
+        for b_st, b_ed in bounds:
+            b_st_abs = d * 1440 + int(b_st)
+            b_ed_abs = d * 1440 + int(b_ed)
+            ov = float(max(0, min(ed_abs, b_ed_abs) - max(st_abs, b_st_abs)))
+            if ov <= 0:
+                continue
 
-    return out
+            center = float((b_st + b_ed) / 2.0)
+            delta_sleep = 0.0 if np.isnan(prev_sleep) else float(ov - prev_sleep)
+            slope_sleep = 0.0
+            if not np.isnan(prev_center):
+                dt = max(center - prev_center, 1.0)
+                slope_sleep = float((ov - prev_sleep) / dt)
+
+            rows.append([
+                float(b_st), float(b_ed), center,
+                ov, 1.0,
+                delta_sleep, slope_sleep,
+                0.0 if np.isnan(eff) else float(eff),
+                0.0 if np.isnan(lat) else float(lat),
+                0.0 if np.isnan(tst) else float(tst),
+                0.0 if np.isnan(waso) else float(waso),
+                0.0 if np.isnan(awak) else float(awak),
+            ])
+
+            prev_sleep = ov
+            prev_center = center
+
+        by_day_rows[d] = np.array(rows, dtype=np.float32) if rows else np.zeros((0, len(SLEEP_PATCH_FEAT)), dtype=np.float32)
+
+    return by_day_rows
 
 
-# =========================
-# 主流程
-# =========================
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--window_min', type=int, default=5)
+    parser.add_argument('--out_npz', type=str, default=str(OUT_DIR / 'multimodal_event_sequences.npz'))
+    parser.add_argument('--out_index', type=str, default=str(OUT_DIR / 'multimodal_event_index.csv'))
+    args = parser.parse_args()
+
+    out_npz = Path(args.out_npz)
+    out_index = Path(args.out_index)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+
     labels = load_labels()
 
-    # 存储各sample的三模态事件序列
     rr_store: Dict[str, np.ndarray] = {}
     act_store: Dict[str, np.ndarray] = {}
     sleep_store: Dict[str, np.ndarray] = {}
-
-    # 索引表：记录每个sample长度、是否缺失、标签等
     index_rows = []
 
     user_dirs = sorted([p for p in DATA_ROOT.glob('user_*') if p.is_dir()])
     for udir in user_dirs:
         user_id = udir.name
 
-        rr_by_day = build_rr_events(udir / 'RR.csv')
-        act_by_day = build_activity_events(udir / 'Activity.csv')
-        sleep_by_day = build_sleep_events(udir / 'sleep.csv')
+        rr_by_day = build_rr_patches(udir / 'RR.csv', args.window_min)
+        act_by_day = build_activity_patches(udir / 'Activity.csv', args.window_min)
+        sleep_by_day = build_sleep_patches(udir / 'sleep.csv', args.window_min)
 
-        # 一个样本日，只要任一模态或标签出现，就纳入
         day_set = set(rr_by_day.keys()) | set(act_by_day.keys()) | set(sleep_by_day.keys())
         if not labels.empty:
             day_set |= set(labels[labels['user_id'] == user_id]['day'].astype(int).tolist())
 
         for d in sorted(day_set):
-            sample_id = f'{user_id}_day{d}'
+            sid = f'{user_id}_day{d}'
 
-            rr_arr = rr_by_day.get(d, np.zeros((0, len(RR_EVENT_FEAT)), dtype=np.float32))
-            act_arr = act_by_day.get(d, np.zeros((0, len(ACT_EVENT_FEAT)), dtype=np.float32))
-            sleep_arr = sleep_by_day.get(d, np.zeros((0, len(SLEEP_EVENT_FEAT)), dtype=np.float32))
+            rr_arr = rr_by_day.get(d, np.zeros((0, len(RR_PATCH_FEAT)), dtype=np.float32))
+            act_arr = act_by_day.get(d, np.zeros((0, len(ACT_PATCH_FEAT)), dtype=np.float32))
+            sleep_arr = sleep_by_day.get(d, np.zeros((0, len(SLEEP_PATCH_FEAT)), dtype=np.float32))
 
-            rr_store[sample_id] = rr_arr
-            act_store[sample_id] = act_arr
-            sleep_store[sample_id] = sleep_arr
+            rr_store[sid] = rr_arr
+            act_store[sid] = act_arr
+            sleep_store[sid] = sleep_arr
 
             row = {
-                'sample_id': sample_id,
+                'sample_id': sid,
                 'user_id': user_id,
                 'day': int(d),
                 'rr_len': int(rr_arr.shape[0]),
@@ -345,7 +413,6 @@ def main() -> None:
                 'sleep_has': int(sleep_arr.shape[0] > 0),
             }
 
-            # 关联标签
             if not labels.empty:
                 m = labels[(labels['user_id'] == user_id) & (labels['day'].astype(int) == int(d))]
                 if len(m) > 0:
@@ -355,7 +422,6 @@ def main() -> None:
 
             index_rows.append(row)
 
-    # npz保存：用前缀区分模态，便于后续读取过滤
     save_dict = {}
     for sid, arr in rr_store.items():
         save_dict[f'rr::{sid}'] = arr
@@ -364,20 +430,17 @@ def main() -> None:
     for sid, arr in sleep_store.items():
         save_dict[f'sleep::{sid}'] = arr
 
-    # 附带保存特征名
-    save_dict['rr_feat_names'] = np.array(RR_EVENT_FEAT, dtype=object)
-    save_dict['act_feat_names'] = np.array(ACT_EVENT_FEAT, dtype=object)
-    save_dict['sleep_feat_names'] = np.array(SLEEP_EVENT_FEAT, dtype=object)
+    save_dict['rr_feat_names'] = np.array(RR_PATCH_FEAT, dtype=object)
+    save_dict['act_feat_names'] = np.array(ACT_PATCH_FEAT, dtype=object)
+    save_dict['sleep_feat_names'] = np.array(SLEEP_PATCH_FEAT, dtype=object)
 
-    # 保存文件
     index_df = pd.DataFrame(index_rows)
-    np.savez_compressed(OUT_NPZ, **save_dict)
-    index_df.to_csv(OUT_INDEX, index=False)
+    np.savez_compressed(out_npz, **save_dict)
+    index_df.to_csv(out_index, index=False)
 
-    # 打印形状摘要（变长序列，用长度范围描述）
-    rr_dim = len(RR_EVENT_FEAT)
-    act_dim = len(ACT_EVENT_FEAT)
-    sleep_dim = len(SLEEP_EVENT_FEAT)
+    rr_dim = len(RR_PATCH_FEAT)
+    act_dim = len(ACT_PATCH_FEAT)
+    sleep_dim = len(SLEEP_PATCH_FEAT)
 
     rr_min = int(index_df['rr_len'].min()) if len(index_df) else 0
     rr_max = int(index_df['rr_len'].max()) if len(index_df) else 0
@@ -386,9 +449,9 @@ def main() -> None:
     sleep_min = int(index_df['sleep_len'].min()) if len(index_df) else 0
     sleep_max = int(index_df['sleep_len'].max()) if len(index_df) else 0
 
-    print(f'[OK] saved event npz: {OUT_NPZ}')
-    print(f'[OK] saved index csv: {OUT_INDEX}')
-    print(f'[OK] n_samples={len(index_df)}')
+    print(f'[OK] saved event npz: {out_npz}')
+    print(f'[OK] saved index csv: {out_index}')
+    print(f'[OK] window_min={args.window_min}, n_samples={len(index_df)}')
     print('[SHAPE] token维度:')
     print(f'  RR token dim    = {rr_dim}')
     print(f'  ACT token dim   = {act_dim}')

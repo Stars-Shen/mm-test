@@ -16,7 +16,8 @@ from torch.utils.data.distributed import DistributedSampler
 
 from dataset_structured import StructuredDataset, structured_collate_fn
 from dataset_event import EventDataset, event_collate_fn
-from model_multimodal_regression import MultiModalEventRegressor, MultiModalStructuredRegressor
+from dataset_hybrid import HybridDataset, hybrid_collate_fn
+from model_multimodal_regression import MultiModalEventRegressor, MultiModalHybridRegressor, MultiModalStructuredRegressor
 
 
 def set_seed(seed: int) -> None:
@@ -82,9 +83,16 @@ def build_dataset_and_collate(args):
     if args.data_format == 'structured':
         ds = StructuredDataset(str(processed / 'multimodal_4d_tensors.npz'))
         collate = structured_collate_fn
-    else:
+    elif args.data_format == 'event':
         ds = EventDataset(str(processed / 'multimodal_event_sequences.npz'), str(processed / 'multimodal_event_index.csv'))
         collate = event_collate_fn
+    else:
+        ds = HybridDataset(
+            str(processed / 'multimodal_4d_tensors.npz'),
+            str(processed / 'multimodal_event_sequences.npz'),
+            str(processed / 'multimodal_event_index.csv'),
+        )
+        collate = hybrid_collate_fn
     return ds, collate
 
 
@@ -157,11 +165,10 @@ def build_loaders_for_indices(
 
 
 def build_model(args, batch_example: Dict, device: torch.device) -> torch.nn.Module:
-    rr_dim = int(batch_example['rr'].shape[-1])
-    act_dim = int(batch_example['act'].shape[-1])
-    sleep_dim = int(batch_example['sleep'].shape[-1])
-
     if args.data_format == 'structured':
+        rr_dim = int(batch_example['rr'].shape[-1])
+        act_dim = int(batch_example['act'].shape[-1])
+        sleep_dim = int(batch_example['sleep'].shape[-1])
         model = MultiModalStructuredRegressor(
             rr_dim,
             act_dim,
@@ -174,7 +181,10 @@ def build_model(args, batch_example: Dict, device: torch.device) -> torch.nn.Mod
             structured_use_hour_emb=args.structured_use_hour_emb,
             fusion_temporal_layers=args.fusion_temporal_layers,
         )
-    else:
+    elif args.data_format == 'event':
+        rr_dim = int(batch_example['rr'].shape[-1])
+        act_dim = int(batch_example['act'].shape[-1])
+        sleep_dim = int(batch_example['sleep'].shape[-1])
         model = MultiModalEventRegressor(
             rr_dim,
             act_dim,
@@ -189,6 +199,31 @@ def build_model(args, batch_example: Dict, device: torch.device) -> torch.nn.Mod
             event_use_time_feat=args.event_use_time_feat,
             event_max_tokens=args.event_max_tokens,
             fusion_temporal_layers=args.fusion_temporal_layers,
+        )
+    else:
+        model = MultiModalHybridRegressor(
+            struct_rr_dim=int(batch_example['struct_rr'].shape[-1]),
+            struct_act_dim=int(batch_example['struct_act'].shape[-1]),
+            struct_sleep_dim=int(batch_example['struct_sleep'].shape[-1]),
+            event_rr_dim=int(batch_example['event_rr'].shape[-1]),
+            event_act_dim=int(batch_example['event_act'].shape[-1]),
+            event_sleep_dim=int(batch_example['event_sleep'].shape[-1]),
+            embed_dim=args.embed_dim,
+            hidden_dim=args.hidden_dim,
+            structured_max_hour=args.structured_max_hour,
+            structured_cnn_layers=args.structured_cnn_layers,
+            structured_cnn_kernel_size=args.structured_cnn_kernel_size,
+            structured_use_hour_emb=args.structured_use_hour_emb,
+            event_time_feat_dim=args.event_time_feat_dim,
+            event_n_heads=args.event_n_heads,
+            event_n_layers=args.event_n_layers,
+            event_ff_mult=args.event_ff_mult,
+            event_dropout=args.event_dropout,
+            event_use_time_feat=args.event_use_time_feat,
+            event_max_tokens=args.event_max_tokens,
+            fusion_temporal_layers=args.fusion_temporal_layers,
+            hybrid_align_heads=args.hybrid_align_heads,
+            hybrid_align_dropout=args.hybrid_align_dropout,
         )
     return model.to(device)
 
@@ -219,6 +254,17 @@ def run_epoch(model, loader, optimizer, device, target_name: str, train: bool = 
             rr_t = int(batch['rr'].shape[2])
             act_t = int(batch['act'].shape[2])
             sleep_t = int(batch['sleep'].shape[2])
+            if rr_t == 0 or act_t == 0 or sleep_t == 0:
+                mode = 'train' if train else 'val'
+                user_ids = batch_np.get('user_id', []) if isinstance(batch_np, dict) else []
+                ddp_print(
+                    f'[DEBUG][FOLD {fold_id}][Epoch {epoch:03d}][{mode}][batch {batch_idx}] '
+                    f'zero-T detected: rr_T={rr_t}, act_T={act_t}, sleep_T={sleep_t}, users={user_ids}'
+                )
+        if 'event_rr_step_mask' in batch and 'event_act_step_mask' in batch and 'event_sleep_step_mask' in batch:
+            rr_t = int(batch['event_rr'].shape[2])
+            act_t = int(batch['event_act'].shape[2])
+            sleep_t = int(batch['event_sleep'].shape[2])
             if rr_t == 0 or act_t == 0 or sleep_t == 0:
                 mode = 'train' if train else 'val'
                 user_ids = batch_np.get('user_id', []) if isinstance(batch_np, dict) else []
@@ -314,7 +360,7 @@ def train_one_fold(args, fold_id: int, train_loader: DataLoader, val_loader: Dat
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_format', type=str, default='structured', choices=['structured', 'event'])
+    parser.add_argument('--data_format', type=str, default='structured', choices=['structured', 'event', 'hybrid'])
     parser.add_argument('--processed_dir', type=str, default='/home/wqshen/mm-test/code/baseline2_seq/processed')
     parser.add_argument(
         '--target',
@@ -348,6 +394,9 @@ def main():
 
     # 融合后的跨天序列建模（GRU）
     parser.add_argument('--fusion_temporal_layers', type=int, default=1)
+    # hybrid 两级策略中的学习式对齐
+    parser.add_argument('--hybrid_align_heads', type=int, default=4)
+    parser.add_argument('--hybrid_align_dropout', type=float, default=0.1)
 
     parser.add_argument('--train_ratio', type=float, default=0.8)
     parser.add_argument('--seed', type=int, default=42)
@@ -376,6 +425,8 @@ def main():
         args.target = args.target.replace('label_', 'y_')
     if args.data_format == 'event' and args.target.startswith('y_'):
         args.target = args.target.replace('y_', 'label_')
+    if args.data_format == 'hybrid' and args.target.startswith('label_'):
+        args.target = args.target.replace('label_', 'y_')
 
     ds, collate = build_dataset_and_collate(args)
     n = len(ds)

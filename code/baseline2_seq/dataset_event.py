@@ -34,12 +34,23 @@ class UserEventDataset:
         # DDP + DataLoader(num_workers>0) 下，直接持有 NpzFile 句柄容易触发并发解压错误。
         # 这里把 npz 全量读入内存并关闭文件句柄，避免 zlib 并发读失败。
         with np.load(npz_path, allow_pickle=True) as arr:
-            self.arr = {k: arr[k] for k in arr.files}
+            self.arr = {}
+            for k in arr.files:
+                try:
+                    self.arr[k] = arr[k]
+                except ModuleNotFoundError:
+                    # 兼容不同numpy版本之间 object pickle 路径变化（常见于 *_feat_names）
+                    self.arr[k] = None
         self.index_df = pd.read_csv(index_csv)
+
+        self._fill_missing_feat_names()
 
         self.rr_feat_dim = len(self.arr['rr_feat_names'])
         self.act_feat_dim = len(self.arr['act_feat_names'])
         self.sleep_feat_dim = len(self.arr['sleep_feat_names'])
+        self.rr_feat_names = [str(x) for x in self.arr['rr_feat_names'].tolist()]
+        self.act_feat_names = [str(x) for x in self.arr['act_feat_names'].tolist()]
+        self.sleep_feat_names = [str(x) for x in self.arr['sleep_feat_names'].tolist()]
 
         self.has_label_daily_stress = 'label_daily_stress' in self.index_df.columns
         self.has_label_stai1 = 'label_stai1' in self.index_df.columns
@@ -52,6 +63,61 @@ class UserEventDataset:
             gg = gg.sort_values('day')
             self.user_groups.append(gg.reset_index(drop=True))
 
+    def _infer_dim_by_prefix(self, prefix: str) -> int:
+        for k, v in self.arr.items():
+            if k.startswith(prefix) and isinstance(v, np.ndarray) and v.ndim == 2:
+                return int(v.shape[1])
+        return 0
+
+    def _default_feat_names(self, modal: str, dim: int) -> np.ndarray:
+        if modal == 'rr':
+            if dim == 17:
+                names = [
+                    'patch_start_min', 'patch_end_min', 'patch_center_min',
+                    'rr_count', 'ibi_mean', 'ibi_std', 'ibi_min', 'ibi_max',
+                    'hr_mean', 'hr_std', 'rmssd', 'sdnn', 'pnn50',
+                    'ibi_slope', 'hr_slope', 'delta_ibi_mean', 'delta_hr_mean',
+                ]
+                return np.array(names, dtype='<U32')
+            if dim == 5:
+                return np.array(['hour', 'minute_of_hour', 'second_of_minute', 'ibi_s', 'hr_inst'], dtype='<U32')
+        if modal == 'act':
+            if dim == 19:
+                names = [
+                    'patch_start_min', 'patch_end_min', 'patch_center_min',
+                    'active_minutes', 'event_count', 'intensity_mean',
+                    'delta_active_minutes', 'slope_active_minutes',
+                ] + [f'code_{i}_minutes' for i in range(11)]
+                return np.array(names, dtype='<U32')
+            if dim == 4:
+                return np.array(['start_hour', 'end_hour', 'duration_min', 'activity_code'], dtype='<U32')
+        if modal == 'sleep':
+            if dim == 12:
+                names = [
+                    'patch_start_min', 'patch_end_min', 'patch_center_min',
+                    'sleep_minutes', 'segment_count',
+                    'delta_sleep_minutes', 'slope_sleep_minutes',
+                    'efficiency', 'latency', 'tst', 'waso', 'n_awakenings',
+                ]
+                return np.array(names, dtype='<U32')
+            if dim == 10:
+                names = [
+                    'start_hour', 'end_hour', 'duration_min', 'cross_day', 'cross_hour',
+                    'efficiency', 'latency', 'tst', 'waso', 'n_awakenings',
+                ]
+                return np.array(names, dtype='<U32')
+        return np.array([f'feat_{i}' for i in range(dim)], dtype='<U32')
+
+    def _fill_missing_feat_names(self) -> None:
+        for modal, key, prefix in [
+            ('rr', 'rr_feat_names', 'rr::'),
+            ('act', 'act_feat_names', 'act::'),
+            ('sleep', 'sleep_feat_names', 'sleep::'),
+        ]:
+            if key not in self.arr or self.arr[key] is None:
+                dim = self._infer_dim_by_prefix(prefix)
+                self.arr[key] = self._default_feat_names(modal, dim)
+
     def __len__(self) -> int:
         return len(self.user_groups)
 
@@ -63,13 +129,37 @@ class UserEventDataset:
         return np.zeros((0, d), dtype=np.float32)
 
     @staticmethod
-    def _build_time_feat_from_len(length: int) -> np.ndarray:
-        """构造事件时间特征: [delta_time, since_day_start]（归一化到[0,1]）"""
+    def _build_time_feat_from_sequence(seq: np.ndarray, feat_names: List[str]) -> np.ndarray:
+        """
+        构造事件时间特征: [delta_time, since_day_start]（归一化到[0,1]）。
+        优先从token里的 patch_center_min（或等价时间列）提取真实时间；失败再回退到等间隔序号。
+        """
+        length = int(seq.shape[0])
         if length <= 0:
             return np.zeros((0, 2), dtype=np.float32)
+
+        time_col = -1
+        for name in ['patch_center_min', 'center_min', 'time_min', 'start_min', 'patch_start_min', 'hour']:
+            if name in feat_names:
+                time_col = feat_names.index(name)
+                break
+
+        if time_col >= 0:
+            t = seq[:, time_col].astype(np.float32)
+            t = np.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
+            # hour列需要映射到分钟尺度
+            if feat_names[time_col] == 'hour':
+                t = t * 60.0
+            t = np.maximum.accumulate(t)
+            delta = np.zeros((length,), dtype=np.float32)
+            if length > 1:
+                delta[1:] = t[1:] - t[:-1]
+            delta = np.clip(delta / 1440.0, 0.0, 1.0)
+            since = np.clip(t / 1440.0, 0.0, 1.0)
+            return np.stack([delta, since], axis=-1).astype(np.float32)
+
         if length == 1:
             return np.array([[0.0, 0.0]], dtype=np.float32)
-
         since = np.linspace(0.0, 1.0, num=length, dtype=np.float32)
         delta = np.zeros((length,), dtype=np.float32)
         delta[1:] = since[1:] - since[:-1]
@@ -114,9 +204,9 @@ class UserEventDataset:
             act_list.append(act)
             sleep_list.append(sleep)
 
-            rr_time_list.append(self._build_time_feat_from_len(rr.shape[0]))
-            act_time_list.append(self._build_time_feat_from_len(act.shape[0]))
-            sleep_time_list.append(self._build_time_feat_from_len(sleep.shape[0]))
+            rr_time_list.append(self._build_time_feat_from_sequence(rr, self.rr_feat_names))
+            act_time_list.append(self._build_time_feat_from_sequence(act, self.act_feat_names))
+            sleep_time_list.append(self._build_time_feat_from_sequence(sleep, self.sleep_feat_names))
 
             rr_has = int(r['rr_has'])
             act_has = int(r['act_has'])
